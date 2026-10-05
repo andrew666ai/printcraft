@@ -38,6 +38,7 @@ printcraft-create = { path = "crates/create", version = "0.2.0" }
 printcraft-forms = { path = "crates/forms", version = "0.2.0" }
 printcraft-render = { path = "crates/render", version = "0.2.0" }
 printcraft-engine = { path = "crates/engine", version = "0.2.0" }
+printcraft-guard = { path = "crates/guard", version = "0.2.0" }
 printcraft-ui-egui = { path = "crates/ui-egui", version = "0.2.0" }
 printcraft-automation = { path = "crates/automation", version = "0.2.0", default-features = false }
 

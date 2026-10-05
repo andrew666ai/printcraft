@@ -1337,7 +1337,7 @@ fn ocr_recognize_files_writes_searchable_copies() {
 #[test]
 fn javascript_through_tools() {
     let dir = workdir("js");
-    let mut a = auto(&dir);
+    let mut a = auto(&dir).grant(printcraft_automation::guard::Capability::JavaScriptRun);
     let doc = ok(&mut a, "doc_open", json!({ "path": "a.pdf" }))["doc"].as_u64().unwrap();
     for (name, y) in [("Price", 20), ("Qty", 60), ("Total", 100)] {
         ok(&mut a, "form_add_field", json!({ "doc": doc, "page": 1, "type": "text", "rect": [20, y, 180, y + 22], "name": name }));
@@ -1400,7 +1400,7 @@ fn merging_form_data_into_a_spreadsheet() {
 #[test]
 fn field_actions_through_tools() {
     let dir = workdir("field-actions");
-    let mut a = auto(&dir);
+    let mut a = auto(&dir).grant(printcraft_automation::guard::Capability::JavaScriptRun);
     let doc = ok(&mut a, "doc_open", json!({ "path": "a.pdf" }))["doc"].as_u64().unwrap();
     ok(&mut a, "form_add_field", json!({ "doc": doc, "page": 1, "type": "button", "rect": [20, 20, 120, 42], "name": "Go" }));
     let r = ok(
@@ -1503,4 +1503,65 @@ fn exporting_to_word_html_and_rtf() {
     assert!(std::fs::read(dir.join("a.docx")).unwrap().starts_with(b"PK"));
     assert!(std::fs::read_to_string(dir.join("a.rtf")).unwrap().contains("Page 2"));
     assert!(a.call("doc_export_office", &json!({ "doc": doc, "path": "a.xyz" })).is_err());
+}
+
+#[test]
+fn javascript_is_denied_until_granted_and_audited_without_the_script() {
+    let dir = workdir("js-deny");
+    let mut a = auto(&dir);
+    let doc = ok(&mut a, "doc_open", json!({ "path": "a.pdf" }))["doc"].as_u64().unwrap();
+    let err = a.call("js_run", &json!({ "doc": doc, "script": "app.alert('secret script')" })).unwrap_err();
+    assert!(err.to_string().contains("capability denied: JavaScriptRun"), "{err}");
+    let turned_on = a.call("js_enabled", &json!({ "enabled": true })).unwrap_err();
+    assert!(turned_on.to_string().contains("capability denied: JavaScriptRun"), "{turned_on}");
+    let events = a.audit_events();
+    let deny = events.iter().find(|event| event.method == "js_run").expect("js_run audit");
+    assert_eq!((deny.decision, deny.outcome.as_str()), ("deny", "denied"));
+    let line = deny.to_json().to_string();
+    assert!(!line.contains("secret script"), "{line}");
+    assert!(!line.contains("a.pdf"), "{line}");
+    let open = events.iter().find(|event| event.method == "doc_open").expect("doc_open audit");
+    assert_eq!(open.decision, "allow");
+    assert!(!open.to_json().to_string().contains("a.pdf"));
+    a.security_session_for_test().force_expired();
+    let expired = a.call("doc_list", &json!({})).unwrap_err();
+    assert!(expired.to_string().contains("session expired"), "{expired}");
+}
+
+#[test]
+fn rooted_paths_reject_traversal_absolute_and_device_names() {
+    let dir = workdir("path-guard");
+    let mut a = auto(&dir);
+    for path in ["../a.pdf", "/etc/passwd", "in/../../a.pdf", "CON", "com1.txt", "a\\b.pdf", "C:a.pdf"] {
+        let err = a.call("doc_open", &json!({ "path": path })).unwrap_err();
+        let message = err.to_string();
+        assert!(!message.contains("No such file"), "{path}: {message}");
+        assert!(
+            message.contains("not allowed") || message.contains("device") || message.contains("separator") || message.contains("empty"),
+            "{path}: {message}"
+        );
+    }
+    assert!(ok(&mut a, "doc_open", json!({ "path": "a.pdf" }))["pages"].as_u64().unwrap() >= 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn rooted_symlink_that_leaves_the_root_is_rejected() {
+    let dir = workdir("symlink-guard");
+    let outside = std::env::temp_dir().join(format!("printcraft-outside-{}-{}", std::process::id(), "symlink-guard"));
+    std::fs::write(&outside, fixture(1)).unwrap();
+    std::os::unix::fs::symlink(&outside, dir.join("link.pdf")).unwrap();
+    let mut a = auto(&dir);
+    let err = a.call("doc_open", &json!({ "path": "link.pdf" })).unwrap_err();
+    assert!(err.to_string().contains("outside"), "{err}");
+    let _ = std::fs::remove_file(outside);
+}
+
+#[cfg(feature = "mcp")]
+#[test]
+fn mcp_rejects_an_oversized_request_line() {
+    let mut server = McpServer::new(Automation::new());
+    let line = "x".repeat((1 << 20) + 1);
+    let reply = server.handle_line(&line).expect("reply");
+    assert!(reply.contains("exceeds"), "{reply}");
 }

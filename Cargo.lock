@@ -3808,6 +3808,7 @@ dependencies = [
  "image",
  "png 0.18.1",
  "printcraft-engine",
+ "printcraft-guard",
  "printcraft-organize",
  "printcraft-render",
  "serde_json",
@@ -3959,6 +3960,14 @@ name = "printcraft-geom"
 version = "0.2.0"
 
 [[package]]
+name = "printcraft-guard"
+version = "0.2.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "serde_json",
+]
+
+[[package]]
 name = "printcraft-js"
 version = "0.2.0"
 dependencies = [
@@ -4083,13 +4092,13 @@ dependencies = [
  "egui",
  "egui_extras",
  "egui_kittest",
- "getrandom 0.4.3",
  "image",
  "js-sys",
  "log",
  "png 0.18.1",
  "printcraft-cos",
  "printcraft-engine",
+ "printcraft-guard",
  "printcraft-model",
  "printcraft-render",
  "rfd",

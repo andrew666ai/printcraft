@@ -311,6 +311,9 @@ impl Automation {
 
     pub(crate) fn action_run(&mut self, a: &Args) -> Result<Value> {
         use printcraft_engine::actions::{Action, Step, builtin, run_on};
+        if crate::policy::requests_javascript(a.0) {
+            self.ensure(printcraft_guard::Capability::JavaScriptRun)?;
+        }
         let action = if let Some(name) = a.opt_str("action")? {
             builtin()
                 .into_iter()
@@ -327,6 +330,9 @@ impl Automation {
                 .collect::<Result<Vec<_>>>()?;
             Action { name: "Custom".into(), description: String::new(), steps, builtin: false }
         };
+        if action.steps.iter().any(|step| step.id() == "run_javascript") {
+            self.ensure(printcraft_guard::Capability::JavaScriptRun)?;
+        }
         let folder = self.resolve(a.str("folder")?, true)?;
         std::fs::create_dir_all(&folder).map_err(|e| failed(e.to_string()))?;
         let mut out = Vec::new();
@@ -494,6 +500,9 @@ impl Automation {
 
     pub(crate) fn js_enabled(&mut self, a: &Args) -> Result<Value> {
         if let Some(on) = a.opt_bool("enabled")? {
+            if on && !self.caps.contains(printcraft_guard::Capability::JavaScriptRun) {
+                return Err(crate::denied(printcraft_guard::Capability::JavaScriptRun));
+            }
             self.session.set_javascript(on);
         }
         Ok(json!({ "enabled": self.session.javascript() }))

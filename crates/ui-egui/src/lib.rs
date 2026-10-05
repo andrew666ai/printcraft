@@ -777,8 +777,13 @@ impl PrintCraftApp {
         client
     }
 
-    /// Open a web link in the system browser (a new tab on the web).
+    /// Open an http, https, or mailto link in the system browser (a new tab on the web).
+    /// Other schemes, including `javascript:` and `file:`, are refused.
     pub fn open_url(&mut self, url: &str) {
+        if !printcraft_guard::external_url_allowed(url) {
+            self.notify("Blocked a link that is not an http, https, or mailto address");
+            return;
+        }
         if let Some(ctx) = &self.ctx {
             ctx.open_url(egui::OpenUrl::new_tab(url));
         }

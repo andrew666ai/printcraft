@@ -10,6 +10,9 @@
 //! `--control <file>` enables the UI control channel (off by default): the app listens on a random
 //! loopback port and writes `{"port", "token", "pid"}` to `<file>` (owner-only permissions).
 //! Agents then drive it with `printcraft-cli ui --control <file> <method> …`.
+//! Optional: `--control-token`, `--control-token-file`, `--control-capabilities`, and
+//! `--control-untrusted`. JavaScript stays off for automation unless `JavaScriptRun` is named.
+//! The listener is loopback-only; do not tunnel it. See `SECURITY.md`.
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
@@ -40,6 +43,10 @@ fn main() -> eframe::Result {
     let mut files = Vec::new();
     let mut options: Vec<(String, String)> = Vec::new();
     let mut control_file: Option<String> = None;
+    let mut control_token: Option<String> = None;
+    let mut control_token_file: Option<String> = None;
+    let mut control_capabilities: Option<String> = None;
+    let mut control_untrusted = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -48,6 +55,10 @@ fn main() -> eframe::Result {
                 return Ok(());
             }
             "--control" => control_file = args.next(),
+            "--control-token" => control_token = args.next(),
+            "--control-token-file" => control_token_file = args.next(),
+            "--control-capabilities" => control_capabilities = args.next(),
+            "--control-untrusted" => control_untrusted = true,
             flag if flag.starts_with("--") => {
                 let value = args.next().unwrap_or_default();
                 options.push((flag.trim_start_matches("--").to_string(), value));
@@ -88,8 +99,19 @@ fn main() -> eframe::Result {
             app.keychain_ids = cfg!(target_os = "macos");
             if let Some(file) = &control_file {
                 let client = app.attach_control(&cc.egui_ctx);
-                match printcraft_ui_egui::control::serve(client).and_then(|ep| write_control_file(file, ep.port, &ep.token).map(|()| ep.port)) {
-                    Ok(port) => eprintln!("printcraft: UI control channel on 127.0.0.1:{port} (connection details in {file})"),
+                let configured = printcraft_ui_egui::control::ControlConfig::resolve(
+                    control_token.clone(),
+                    control_token_file.as_deref().map(std::path::Path::new),
+                    control_capabilities.as_deref(),
+                    control_untrusted,
+                );
+                let started = configured.and_then(|cfg| {
+                    printcraft_ui_egui::control::serve_with(client, cfg)
+                        .and_then(|ep| write_control_file(file, ep.port, &ep.token).map(|()| ep.port))
+                        .map_err(|e| e.to_string())
+                });
+                match started {
+                    Ok(port) => eprintln!("printcraft: UI control channel on 127.0.0.1:{port} (token in {file}; loopback only, do not tunnel)"),
                     Err(e) => eprintln!("printcraft: --control {file}: {e}"),
                 }
             }
