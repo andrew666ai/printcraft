@@ -43,11 +43,7 @@ impl PrintCraftApp {
                         self.views[i].go_to_page(p);
                     }
                 }
-                Request::LaunchUrl(u) => {
-                    if let Some(ctx) = &self.ctx {
-                        ctx.open_url(egui::OpenUrl::new_tab(u));
-                    }
-                }
+                Request::LaunchUrl(u) => self.open_url(&u),
                 Request::Submit(u) => self.notify(format!(
                     "The form asks to be submitted to {u}; PrintCraft doesn't send form data. Save the document to keep your entries."
                 )),

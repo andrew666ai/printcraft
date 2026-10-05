@@ -172,6 +172,7 @@ fn loopback_transport_requires_the_token() {
     use std::io::{BufRead, BufReader, Write};
     let (mut h, c) = harness();
     let ep = printcraft_ui_egui::control::serve(c).unwrap();
+    assert_eq!(ep.token.len(), 64, "256-bit token");
     let talk = |lines: Vec<Value>| {
         let port = ep.port;
         std::thread::spawn(move || {
@@ -209,6 +210,8 @@ fn loopback_transport_requires_the_token() {
     );
     assert_eq!(bad.len(), 1);
     assert_eq!(bad[0]["error"]["code"], -32001);
+    assert_eq!(bad[0]["error"]["message"], "authentication required");
+    assert!(bad[0].get("result").is_none());
     // No auth at all: same.
     let none = pump(&mut h, talk(vec![json!({ "jsonrpc": "2.0", "id": 1, "method": "ui.state" })]));
     assert_eq!(none[0]["error"]["code"], -32001);

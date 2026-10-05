@@ -2,7 +2,8 @@
 //!
 //! **Opt-in only.** Nothing here runs unless the app is started with `--control <file>` (or a
 //! test attaches a [`ControlClient`]). The transport ([`serve`]) listens on loopback only, on a
-//! random port, and every connection must first present the random token written to `<file>`.
+//! random port. The first line on each connection must be `auth` with a 256-bit bearer token
+//! (written to `<file>`, mode `0600`). See `SECURITY.md`. Stdio MCP does not use this token.
 //!
 //! How it works:
 //! - [`ControlPlugin`], an egui plugin, keeps a copy of the AccessKit tree from every frame's
@@ -608,6 +609,37 @@ impl Host for crate::PrintCraftApp {
 }
 
 // ---- transport (native only) -----------------------------------------------------------------
+//
+// Personal use: one 256-bit bearer token gates method dispatch. There is no capability list
+// and no audit log. Budgets: 16 connections, 1 MiB request lines, 8 MiB replies.
+
+#[cfg(not(target_arch = "wasm32"))]
+use std::io::{BufRead, Write};
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::Path;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Duration;
+
+/// Maximum encoded JSON request line, including its newline.
+#[cfg(not(target_arch = "wasm32"))]
+pub const MAX_REQUEST_BYTES: usize = 1 << 20;
+/// Maximum encoded JSON reply, including its newline.
+#[cfg(not(target_arch = "wasm32"))]
+pub const MAX_RESPONSE_BYTES: usize = 8 << 20;
+/// Maximum simultaneously serviced TCP connections per listener.
+#[cfg(not(target_arch = "wasm32"))]
+pub const MAX_CONNECTIONS: usize = 16;
+
+#[cfg(not(target_arch = "wasm32"))]
+const TOKEN_BYTES: usize = 32;
+#[cfg(not(target_arch = "wasm32"))]
+const TOKEN_HEX_LEN: usize = TOKEN_BYTES * 2;
+#[cfg(not(target_arch = "wasm32"))]
+const IO_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(not(target_arch = "wasm32"))]
+const AUTH_METHOD: &str = "auth";
 
 /// Where a running app's control channel can be reached (written to the `--control` file).
 #[cfg(not(target_arch = "wasm32"))]
@@ -616,63 +648,134 @@ pub struct Endpoint {
     pub token: String,
 }
 
-/// Listen on `127.0.0.1` (random port) and forward authenticated requests to `client`.
+/// Result of reading one bounded JSON-lines frame.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineRead {
+    Eof,
+    Line,
+    TooLong,
+}
+
+/// Listen on `127.0.0.1` (random port) with a fresh 256-bit token.
 ///
 /// Protocol: newline-delimited JSON-RPC 2.0. The first request on a connection must be
 /// `{"method": "auth", "params": {"token": …}}`; anything else closes the connection.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn serve(client: ControlClient) -> std::io::Result<Endpoint> {
-    use std::io::{BufRead, BufReader, Write};
+    serve_with_token(client, generate_token()?)
+}
+
+/// Listen on `127.0.0.1` using `token` (64 hexadecimal characters). Refuses to bind when the
+/// token is the wrong shape.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn serve_with_token(client: ControlClient, token: String) -> std::io::Result<Endpoint> {
+    let token = token.trim().to_ascii_lowercase();
+    validate_token(&token)?;
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
-    let port = listener.local_addr()?.port();
-    let token = random_token()?;
+    let local = listener.local_addr()?;
+    ensure_loopback(local)?;
+    let port = local.port();
     let expected = token.clone();
-    std::thread::Builder::new().name("printcraft-control".into()).spawn(move || {
-        for stream in listener.incoming().flatten() {
-            let client = client.clone();
-            let expected = expected.clone();
-            let _ = std::thread::Builder::new().name("printcraft-control-conn".into()).spawn(move || {
-                let Ok(read) = stream.try_clone() else { return };
-                let mut write = stream;
-                let mut authed = false;
-                for line in BufReader::new(read).lines() {
-                    let Ok(line) = line else { break };
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    let (reply, close) = match serde_json::from_str::<Value>(&line) {
-                        Err(e) => (rpc_error(Value::Null, -32700, &format!("parse error: {e}")), false),
-                        Ok(msg) => {
-                            let id = msg.get("id").cloned().unwrap_or(Value::Null);
-                            let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
-                            let params = msg.get("params").cloned().unwrap_or(Value::Null);
-                            if !authed {
-                                let ok =
-                                    method == "auth" && params.get("token").and_then(Value::as_str).is_some_and(|t| constant_time_eq(t, &expected));
-                                authed = ok;
-                                if ok {
-                                    (json!({ "jsonrpc": "2.0", "id": id, "result": { "ok": true } }), false)
-                                } else {
-                                    (rpc_error(id, -32001, "authenticate first: auth {token}"), true)
-                                }
-                            } else {
-                                let rx = client.send(method, params);
-                                match rx.recv_timeout(std::time::Duration::from_secs(30)) {
-                                    Ok(Ok(v)) => (json!({ "jsonrpc": "2.0", "id": id, "result": v }), false),
-                                    Ok(Err(e)) => (rpc_error(id, -32000, &e), false),
-                                    Err(_) => (rpc_error(id, -32002, "the app did not answer within 30 s"), false),
-                                }
-                            }
-                        }
-                    };
-                    if writeln!(write, "{reply}").and_then(|_| write.flush()).is_err() || close {
-                        break;
+    std::thread::Builder::new().name("printcraft-control".into()).spawn(move || accept_loop(listener, expected, client))?;
+    Ok(Endpoint { port, token })
+}
+
+/// Resolve the listener's token. A missing token file is created (mode `0600` on Unix) and the
+/// token is not returned anywhere else. Passing both a token and a file is an error. With
+/// neither, a fresh token is returned for the caller to store in the `--control` file.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn resolve_server_token(supplied: Option<&str>, token_file: Option<&Path>) -> std::io::Result<String> {
+    if supplied.is_some() && token_file.is_some() {
+        return Err(std::io::Error::other("use either a control token or a control token file, not both"));
+    }
+    if let Some(token) = supplied {
+        let token = token.trim().to_ascii_lowercase();
+        validate_token(&token)?;
+        return Ok(token);
+    }
+    let Some(path) = token_file else {
+        return generate_token();
+    };
+    if path.exists() {
+        return read_token_file(path);
+    }
+    let token = generate_token()?;
+    match create_token_file(path, &token) {
+        Ok(()) => Ok(token),
+        Err(_) if path.exists() => read_token_file(path),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn accept_loop(listener: std::net::TcpListener, token: String, client: ControlClient) {
+    let limiter = ConnectionLimiter::new(MAX_CONNECTIONS);
+    let token = Arc::<str>::from(token);
+    for stream in listener.incoming().flatten() {
+        if stream.peer_addr().ok().is_none_or(|addr| ensure_loopback(addr).is_err()) {
+            continue;
+        }
+        let Some(permit) = limiter.try_acquire() else {
+            let _ = configure_stream(&stream);
+            let mut stream = stream;
+            let _ = write_reply(&mut stream, &rpc_error(Value::Null, -32004, "connection limit reached"));
+            continue;
+        };
+        let client = client.clone();
+        let token = Arc::clone(&token);
+        let _ = std::thread::Builder::new().name("printcraft-control-conn".into()).spawn(move || {
+            let _permit = permit;
+            serve_connection(stream, &token, client);
+        });
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn serve_connection(stream: std::net::TcpStream, token: &str, client: ControlClient) {
+    if configure_stream(&stream).is_err() {
+        return;
+    }
+    let Ok(read) = stream.try_clone() else { return };
+    let mut reader = std::io::BufReader::new(read);
+    let mut write = stream;
+    let mut line = String::new();
+    let mut authed = false;
+    loop {
+        match read_bounded_line(&mut reader, &mut line) {
+            Ok(LineRead::Eof) | Err(_) => break,
+            Ok(LineRead::TooLong) => {
+                let reply = rpc_error(Value::Null, -32005, &format!("request exceeds {MAX_REQUEST_BYTES} bytes"));
+                let _ = write_reply(&mut write, &reply);
+                break;
+            }
+            Ok(LineRead::Line) if line.trim().is_empty() => continue,
+            Ok(LineRead::Line) => {}
+        }
+        let (reply, close) = if !authed {
+            let (reply, ok) = authentication_reply(&line, token);
+            authed = ok;
+            (reply, !ok)
+        } else {
+            match serde_json::from_str::<Value>(&line) {
+                Err(e) => (rpc_error(Value::Null, -32700, &format!("parse error: {e}")), false),
+                Ok(msg) => {
+                    let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                    let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+                    let params = msg.get("params").cloned().unwrap_or(Value::Null);
+                    let rx = client.send(method, params);
+                    match rx.recv_timeout(IO_TIMEOUT) {
+                        Ok(Ok(v)) => (json!({ "jsonrpc": "2.0", "id": id, "result": v }), false),
+                        Ok(Err(e)) => (rpc_error(id, -32000, &e), false),
+                        Err(_) => (rpc_error(id, -32002, "the app did not answer within 30 s"), false),
                     }
                 }
-            });
+            }
+        };
+        if write_reply(&mut write, &reply).is_err() || close {
+            break;
         }
-    })?;
-    Ok(Endpoint { port, token })
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -680,15 +783,399 @@ fn rpc_error(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
+/// The first frame. A failure carries no method result and does not echo the token.
 #[cfg(not(target_arch = "wasm32"))]
-fn constant_time_eq(a: &str, b: &str) -> bool {
-    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+fn authentication_reply(line: &str, expected: &str) -> (Value, bool) {
+    let Ok(msg) = serde_json::from_str::<Value>(line) else {
+        return (rpc_error(Value::Null, -32001, "authentication required"), false);
+    };
+    let id = msg.get("id").cloned().unwrap_or(Value::Null);
+    let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+    let supplied = msg.get("params").and_then(|p| p.get("token")).and_then(Value::as_str).unwrap_or("");
+    if method == AUTH_METHOD && token_matches(expected, supplied) {
+        (json!({ "jsonrpc": "2.0", "id": id, "result": { "ok": true } }), true)
+    } else {
+        (rpc_error(id, -32001, "authentication required"), false)
+    }
 }
 
-/// 128 random bits from the OS, hex-encoded.
+/// Compare fixed-width tokens without leaving early on a mismatching byte.
+/// Hex digits are compared case-insensitively; the 256-bit value is unchanged.
 #[cfg(not(target_arch = "wasm32"))]
-fn random_token() -> std::io::Result<String> {
-    let mut bytes = [0u8; 16];
+fn token_matches(expected: &str, supplied: &str) -> bool {
+    if expected.len() != TOKEN_HEX_LEN || supplied.len() != TOKEN_HEX_LEN {
+        return false;
+    }
+    let mut different = 0u8;
+    for (a, b) in expected.bytes().zip(supplied.bytes()) {
+        different |= a.to_ascii_lowercase() ^ b.to_ascii_lowercase();
+    }
+    different == 0
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn validate_token(token: &str) -> std::io::Result<()> {
+    if token.len() == TOKEN_HEX_LEN && token.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(std::io::Error::other("control token must contain exactly 64 hexadecimal characters"))
+    }
+}
+
+/// 256 random bits from the OS, lowercase hex.
+#[cfg(not(target_arch = "wasm32"))]
+fn generate_token() -> std::io::Result<String> {
+    let mut bytes = [0u8; TOKEN_BYTES];
     getrandom::fill(&mut bytes).map_err(|e| std::io::Error::other(e.to_string()))?;
-    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+    let mut token = String::with_capacity(TOKEN_HEX_LEN);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in bytes {
+        let hi = usize::from(byte >> 4);
+        let lo = usize::from(byte & 0x0f);
+        let Some(hi) = HEX.get(hi).copied() else {
+            return Err(std::io::Error::other("cannot encode control token"));
+        };
+        let Some(lo) = HEX.get(lo).copied() else {
+            return Err(std::io::Error::other("cannot encode control token"));
+        };
+        token.push(char::from(hi));
+        token.push(char::from(lo));
+    }
+    Ok(token)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn ensure_loopback(addr: std::net::SocketAddr) -> std::io::Result<()> {
+    if addr.ip().is_loopback() { Ok(()) } else { Err(std::io::Error::other(format!("{addr} is not a loopback address"))) }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_bounded_line(reader: &mut impl BufRead, line: &mut String) -> std::io::Result<LineRead> {
+    line.clear();
+    let mut limited = std::io::Read::take(reader, (MAX_REQUEST_BYTES + 1) as u64);
+    let n = limited.read_line(line)?;
+    if n == 0 {
+        Ok(LineRead::Eof)
+    } else if n > MAX_REQUEST_BYTES {
+        Ok(LineRead::TooLong)
+    } else {
+        Ok(LineRead::Line)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_token_file(path: &Path) -> std::io::Result<String> {
+    let file = std::fs::File::open(path).map_err(|e| std::io::Error::other(format!("{}: {e}", path.display())))?;
+    let mut limited = std::io::Read::take(file, (TOKEN_HEX_LEN + 2) as u64);
+    let mut token = String::new();
+    std::io::Read::read_to_string(&mut limited, &mut token).map_err(|e| std::io::Error::other(format!("{}: {e}", path.display())))?;
+    let token = token.trim().to_ascii_lowercase();
+    validate_token(&token)?;
+    Ok(token)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn create_token_file(path: &Path, token: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(|e| std::io::Error::other(format!("{}: {e}", parent.display())))?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(|e| std::io::Error::other(format!("{}: {e}", path.display())))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    writeln!(file, "{token}").map_err(|e| std::io::Error::other(format!("{}: {e}", path.display())))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn configure_stream(stream: &std::net::TcpStream) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct ConnectionLimiter {
+    active: AtomicUsize,
+    max: usize,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct ConnectionPermit {
+    limiter: Arc<ConnectionLimiter>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl ConnectionLimiter {
+    fn new(max: usize) -> Arc<Self> {
+        Arc::new(Self { active: AtomicUsize::new(0), max })
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> Option<ConnectionPermit> {
+        let mut current = self.active.load(Ordering::Acquire);
+        loop {
+            if current >= self.max {
+                return None;
+            }
+            let next = current.checked_add(1)?;
+            match self.active.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Some(ConnectionPermit { limiter: Arc::clone(self) }),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        self.limiter.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct LimitedWriter {
+    bytes: Vec<u8>,
+    maximum: usize,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Write for LimitedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let room = self.maximum.saturating_sub(self.bytes.len());
+        if buf.len() > room {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("response exceeds {} bytes", self.maximum)));
+        }
+        self.bytes.try_reserve(buf.len()).map_err(|error| std::io::Error::other(format!("response allocation failed: {error}")))?;
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn encode_with_limit(value: &impl serde::Serialize, maximum: usize) -> Result<Vec<u8>, ()> {
+    let mut writer = LimitedWriter { bytes: Vec::new(), maximum };
+    serde_json::to_writer(&mut writer, value).map_err(|_| ())?;
+    Ok(writer.bytes)
+}
+
+/// Encode one JSON-lines reply. An oversized payload becomes a short error that keeps `id`.
+/// The operation may already have completed.
+#[cfg(not(target_arch = "wasm32"))]
+fn write_reply(out: &mut impl Write, reply: &Value) -> std::io::Result<()> {
+    let encoded = match encode_with_limit(reply, MAX_RESPONSE_BYTES.saturating_sub(1)) {
+        Ok(bytes) => bytes,
+        Err(()) => {
+            let error = rpc_error(
+                reply.get("id").cloned().unwrap_or(Value::Null),
+                -32003,
+                &format!("response exceeds {MAX_RESPONSE_BYTES} bytes; operation may have completed"),
+            );
+            match encode_with_limit(&error, MAX_RESPONSE_BYTES.saturating_sub(1)) {
+                Ok(bytes) => bytes,
+                Err(()) => br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32003,"message":"response budget exceeded"}}"#.to_vec(),
+            }
+        }
+    };
+    out.write_all(&encoded)?;
+    out.write_all(b"\n")?;
+    out.flush()
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod transport_tests {
+    use super::*;
+    use std::io::{BufRead, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    fn roundtrip(addr: std::net::SocketAddr, payloads: &[String]) -> Vec<Value> {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+        let mut replies = Vec::new();
+        for payload in payloads {
+            writeln!(stream, "{payload}").unwrap();
+            stream.flush().unwrap();
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).unwrap();
+            assert!(n > 0, "connection closed before a reply");
+            replies.push(serde_json::from_str(&line).unwrap());
+        }
+        replies
+    }
+
+    #[test]
+    fn generated_tokens_are_256_bits_and_files_stay_private() {
+        let token = generate_token().unwrap();
+        validate_token(&token).unwrap();
+        assert_eq!(token.len(), 64);
+        assert!(token_matches(&token, &token.to_ascii_uppercase()));
+        assert!(!token_matches(&token, &"ab".repeat(32)));
+        let path = std::env::temp_dir().join(format!("printcraft-control-token-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let server = resolve_server_token(None, Some(&path)).unwrap();
+        let again = resolve_server_token(None, Some(&path)).unwrap();
+        assert_eq!(server, again);
+        assert!(token_matches(&server, &again));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "token file mode {mode:o}");
+        }
+        let err = resolve_server_token(Some(&server), Some(&path)).unwrap_err();
+        assert!(err.to_string().contains("not both"), "{err}");
+        match serve_with_token(attach(&egui::Context::default()).1, "short".into()) {
+            Err(err) => assert!(err.to_string().contains("64 hexadecimal"), "{err}"),
+            Ok(_) => panic!("a short token must not open the listener"),
+        }
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn authentication_rejects_a_missing_or_wrong_token_without_a_result() {
+        let token = generate_token().unwrap();
+        let (reply, ok) = authentication_reply(r#"{"jsonrpc":"2.0","id":1,"method":"ui.state"}"#, &token);
+        assert!(!ok);
+        assert_eq!(reply["id"], 1);
+        assert_eq!(reply["error"]["message"], "authentication required");
+        assert!(reply.get("result").is_none());
+
+        let wrong = "f".repeat(64);
+        let line = json!({"jsonrpc":"2.0","id":2,"method":"auth","params":{"token": wrong}}).to_string();
+        let (reply, ok) = authentication_reply(&line, &token);
+        assert!(!ok);
+        assert_eq!(reply["error"]["code"], -32001);
+        let text = reply.to_string();
+        assert!(!text.contains(&token));
+        assert!(!text.contains(&wrong));
+
+        let smuggled = json!({"jsonrpc":"2.0","id":3,"method":"ui.command","params":{"token": token}}).to_string();
+        let (reply, ok) = authentication_reply(&smuggled, &token);
+        assert!(!ok);
+        assert_eq!(reply["error"]["message"], "authentication required");
+
+        let upper = token.to_ascii_uppercase();
+        let line = json!({"jsonrpc":"2.0","id":4,"method":"auth","params":{"token": upper}}).to_string();
+        let (reply, ok) = authentication_reply(&line, &token);
+        assert!(ok);
+        assert_eq!(reply["result"]["ok"], true);
+    }
+
+    #[test]
+    fn unauthenticated_and_wrong_token_are_rejected() {
+        let (_control, client) = attach(&egui::Context::default());
+        let ep = serve(client).unwrap();
+        assert_eq!(ep.token.len(), 64);
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], ep.port));
+
+        let unauth = roundtrip(addr, &[json!({"jsonrpc":"2.0","id":1,"method":"ui.state"}).to_string()]);
+        assert_eq!(unauth.len(), 1);
+        assert_eq!(unauth[0]["error"]["code"], -32001);
+        assert_eq!(unauth[0]["error"]["message"], "authentication required");
+        assert!(unauth[0].get("result").is_none());
+
+        let wrong = "ab".repeat(32);
+        let bad = roundtrip(addr, &[json!({"jsonrpc":"2.0","id":2,"method":"auth","params":{"token": wrong}}).to_string()]);
+        assert_eq!(bad[0]["error"]["message"], "authentication required");
+        assert!(!bad[0].to_string().contains(&wrong));
+        assert!(!bad[0].to_string().contains(&ep.token));
+
+        let upper = ep.token.to_ascii_uppercase();
+        let good = roundtrip(addr, &[json!({"jsonrpc":"2.0","id":3,"method":"auth","params":{"token": upper}}).to_string()]);
+        assert_eq!(good[0]["result"]["ok"], true);
+    }
+
+    #[test]
+    fn oversized_request_is_rejected_without_dispatch() {
+        let (_control, client) = attach(&egui::Context::default());
+        let ep = serve_with_token(client, "c".repeat(64)).unwrap();
+        let mut stream = TcpStream::connect(("127.0.0.1", ep.port)).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        stream.write_all(&vec![b'x'; MAX_REQUEST_BYTES + 1]).unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(stream).read_line(&mut line).unwrap();
+        let reply: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(reply["error"]["code"], -32005);
+        assert!(reply["error"]["message"].as_str().unwrap().contains("request exceeds"));
+        assert!(reply.get("result").is_none());
+    }
+
+    #[test]
+    fn connection_limit_rejects_the_extra_client() {
+        let (_control, client) = attach(&egui::Context::default());
+        let ep = serve_with_token(client, "d".repeat(64)).unwrap();
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], ep.port));
+        let mut held = Vec::new();
+        for i in 0..MAX_CONNECTIONS {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            writeln!(stream, "{}", json!({"jsonrpc":"2.0","id":i,"method":"auth","params":{"token":"d".repeat(64)}})).unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["result"]["ok"], true, "{line}");
+            held.push((stream, reader));
+        }
+        let extra = TcpStream::connect(addr).unwrap();
+        extra.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(extra).read_line(&mut line).unwrap();
+        assert!(line.contains("connection limit reached"), "{line}");
+        drop(held);
+    }
+
+    #[test]
+    fn oversized_reply_is_replaced_and_keeps_the_id() {
+        let reply = json!({"jsonrpc":"2.0","id":7,"result":"x".repeat(MAX_RESPONSE_BYTES)});
+        let mut out = Vec::new();
+        write_reply(&mut out, &reply).unwrap();
+        assert!(out.len() < 1024, "{}", out.len());
+        assert_eq!(out.iter().filter(|&&byte| byte == b'\n').count(), 1);
+        let error: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(error["id"], 7);
+        assert!(error["error"]["message"].as_str().unwrap().contains("operation may have completed"));
+        assert!(!error.to_string().contains("xxxx"));
+    }
+
+    #[test]
+    fn non_loopback_addresses_are_refused() {
+        let v4: std::net::SocketAddr = "0.0.0.0:9".parse().unwrap();
+        let v6: std::net::SocketAddr = "[::]:9".parse().unwrap();
+        assert!(ensure_loopback(v4).unwrap_err().to_string().contains("loopback"));
+        assert!(ensure_loopback(v6).unwrap_err().to_string().contains("loopback"));
+        ensure_loopback("127.0.0.1:9".parse().unwrap()).unwrap();
+        ensure_loopback("[::1]:9".parse().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn bounded_reader_rejects_an_oversized_line() {
+        let input = format!("{}\n", "x".repeat(MAX_REQUEST_BYTES + 1));
+        let mut reader = std::io::Cursor::new(input);
+        let mut line = String::new();
+        assert_eq!(read_bounded_line(&mut reader, &mut line).unwrap(), LineRead::TooLong);
+    }
+
+    #[test]
+    fn connection_limiter_releases_capacity() {
+        let limiter = ConnectionLimiter::new(1);
+        let permit = limiter.try_acquire().unwrap();
+        assert!(limiter.try_acquire().is_none());
+        drop(permit);
+        assert!(limiter.try_acquire().is_some());
+    }
 }
