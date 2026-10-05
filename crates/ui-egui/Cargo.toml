@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 printcraft-engine = { workspace = true }
+printcraft-guard = { workspace = true }
 printcraft-render = { workspace = true }
 egui = { workspace = true }
 egui_extras = { workspace = true }
@@ -23,8 +24,6 @@ png = "0.18"
 base64 = "0.22"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-# Control-channel tokens.
-getrandom = "0.4"
 # Create ▸ Clipboard (images; already in the tree through egui-winit).
 arboard = { version = "3.6", default-features = false, features = ["image-data"] }
 

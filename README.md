@@ -288,7 +288,7 @@ Every engine feature is reachable without the GUI, through one table of JSON-Sch
   { "mcpServers": { "printcraft": { "command": "printcraft-cli", "args": ["mcp", "--root", "/path/to/your/pdfs"] } } }
   ```
 
-  `--root` confines every file the agent can read or write to one directory. Builds that should not include the server at all can use `cargo build -p printcraft-cli --no-default-features`.
+  `--root` confines every file the agent can read or write to one directory. The process is the trust boundary: it starts with every capability except `JavaScriptRun`. `--untrusted` narrows that to reading documents, and `--capabilities` replaces the set. See [SECURITY.md](SECURITY.md). Builds that should not include the server at all can use `cargo build -p printcraft-cli --no-default-features`.
 
 - **The Rust API** (`printcraft_automation::Automation::call`), for embedding.
 
@@ -296,7 +296,7 @@ Edits stay in memory, undoable, until `doc_save`. Saving to the same file append
 
 ### Driving the app itself
 
-Start the desktop app with `printcraft --control /tmp/pc.json` and an agent can see and operate the real interface: the widget tree with labels and positions (from the accessibility tree), clicks, typing, keys, commands, view options and screenshots. This is also off by default. It listens only on loopback, and every connection must present the random token written to that file, which only you can read.
+Start the desktop app with `printcraft --control /tmp/pc.json` and an agent can see and operate the real interface: the widget tree with labels and positions (from the accessibility tree), clicks, typing, keys, commands, view options and screenshots. This is also off by default. It listens only on loopback. The first request must present the random token written to that file, which only you can read. A client that does not ask for capabilities can inspect the document and the widget tree; clicks and commands need `UiControl`, which `printcraft-cli ui` requests. `JavaScriptRun` stays off unless you name it in `--control-capabilities`. Do not tunnel the port. Details are in [SECURITY.md](SECURITY.md).
 
 ```sh
 printcraft-cli ui --control /tmp/pc.json inspect query=rotate      # find widgets
@@ -324,6 +324,7 @@ PrintCraft is a Cargo workspace of focused crates, layered so the core never dep
 | `printcraft-forms` | Interactive forms: the field model, filling with regenerated appearances, Clear form |
 | `printcraft-render` | Rendering, inspection and text extraction with reading order |
 | `printcraft-engine` | The façade every frontend uses: sessions, edits, undo, saving, the tool catalogue |
+| `printcraft-guard` | Automation tokens, capabilities, budgets, path and URL checks, and audit events |
 | `printcraft-automation` | Agent control: the headless tool table, `printcraft-cli run`, and the opt-in MCP server |
 | `printcraft-ui-egui` | The desktop and web interface |
 

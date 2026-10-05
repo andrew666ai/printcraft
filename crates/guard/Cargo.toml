@@ -1,0 +1,15 @@
+[package]
+name = "printcraft-guard"
+description = "Local automation security: tokens, capabilities, budgets, and audit events"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde_json = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+getrandom = "0.4"

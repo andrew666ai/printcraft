@@ -222,6 +222,76 @@ fn loopback_transport_requires_the_token() {
         ]),
     );
     assert_eq!(good[0]["result"]["ok"], true);
+    assert!(good[0]["result"]["capabilities"].as_array().unwrap().iter().any(|c| c == "UiInspect"));
+    assert!(!good[0]["result"]["capabilities"].as_array().unwrap().iter().any(|c| c == "UiControl"));
+    assert!(!good[0]["result"]["capabilities"].as_array().unwrap().iter().any(|c| c == "JavaScriptRun"));
     assert_eq!(good[1]["result"]["documents"][0]["name"], "doc.pdf");
-    assert!(good[2]["error"]["message"].as_str().unwrap().contains("disabled"));
+    assert!(good[2]["error"]["message"].as_str().unwrap().contains("capability denied: UiControl"), "{good:?}");
+
+    let granted = pump(
+        &mut h,
+        talk(vec![
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "auth", "params": { "token": ep.token, "capabilities": ["UiControl", "DocumentRead", "UiInspect"] } }),
+            json!({ "jsonrpc": "2.0", "id": 2, "method": "ui.command", "params": { "id": "edit.undo" } }),
+        ]),
+    );
+    assert_eq!(granted[0]["result"]["ok"], true);
+    assert!(granted[1]["error"]["message"].as_str().unwrap().contains("disabled"), "{granted:?}");
+
+    let port = ep.port;
+    let token = ep.token.clone();
+    let oversized = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).expect("timeout");
+        stream.set_write_timeout(Some(std::time::Duration::from_secs(2))).expect("timeout");
+        let mut body = vec![b'x'; (1 << 20) + 1];
+        body.push(b'\n');
+        let _ = stream.write_all(&body);
+        let mut buf = [0u8; 512];
+        let n = stream.read(&mut buf).unwrap_or(0);
+        String::from_utf8_lossy(&buf[..n]).into_owned()
+    });
+    let oversized = oversized.join().expect("oversized client");
+    assert!(oversized.contains("exceeds"), "{oversized}");
+
+    let mut held = Vec::new();
+    for _ in 0..16 {
+        held.push(authed_socket(ep.port, &token));
+    }
+    let mut rejected = String::new();
+    for _ in 0..20 {
+        rejected = probe_connection(ep.port);
+        if rejected.contains("too many connections") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(rejected.contains("too many connections"), "{rejected}");
+    drop(held);
+}
+
+fn authed_socket(port: u16, token: &str) -> std::net::TcpStream {
+    use std::io::{BufRead, BufReader, Write};
+    let stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).expect("timeout");
+    let mut write = stream.try_clone().expect("clone");
+    writeln!(write, "{}", json!({ "jsonrpc": "2.0", "id": 1, "method": "auth", "params": { "token": token } })).expect("auth");
+    let mut line = String::new();
+    BufReader::new(stream.try_clone().expect("clone")).read_line(&mut line).expect("auth reply");
+    assert!(line.contains("\"ok\":true"), "{line}");
+    stream
+}
+
+fn probe_connection(port: u16) -> String {
+    use std::io::{Read, Write};
+    let mut stream = match std::net::TcpStream::connect(("127.0.0.1", port)) {
+        Ok(stream) => stream,
+        Err(e) => return e.to_string(),
+    };
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).expect("timeout");
+    let _ = writeln!(stream, "{}", json!({ "jsonrpc": "2.0", "id": 1, "method": "ui.state" }));
+    let mut buf = [0u8; 512];
+    let n = stream.read(&mut buf).unwrap_or(0);
+    String::from_utf8_lossy(&buf[..n]).into_owned()
 }

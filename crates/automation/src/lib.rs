@@ -18,16 +18,21 @@ mod forms;
 mod links;
 #[cfg(feature = "mcp")]
 pub mod mcp;
+mod policy;
 mod printing;
 mod redact;
 mod signing;
 mod tools;
 
+pub use printcraft_guard as guard;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use printcraft_engine::{DocId, Document, Edit, Session, commands};
+use printcraft_guard::{AuditEvent, AuditLog, Capability, CapabilitySet};
 use printcraft_render::{PageRenderer, PageText, RenderConfig, RenderRequest, RequestKind};
 use serde_json::{Value, json};
 
@@ -70,12 +75,25 @@ fn failed(e: impl std::fmt::Display) -> ToolError {
     ToolError::Failed(e.to_string())
 }
 
+fn denied(cap: Capability) -> ToolError {
+    ToolError::Failed(format!("capability denied: {}", cap.name()))
+}
+
 /// Default and maximum resolution for `page_render`.
 const DEFAULT_DPI: f64 = 96.0;
 const MAX_DPI: f64 = 600.0;
 
 /// Page texts of one document version: (the working bytes, one slot per page).
 type TextCache = (Arc<Vec<u8>>, Vec<Option<Arc<PageText>>>);
+
+/// Whether the current [`Automation::call`] passed the capability gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Gate {
+    /// Failed before authorization (unknown tool, bad arguments).
+    Skip,
+    Allowed,
+    Denied,
+}
 
 /// A headless PrintCraft session driven by tool calls.
 pub struct Automation {
@@ -85,6 +103,11 @@ pub struct Automation {
     renderers: HashMap<DocId, (Arc<Vec<u8>>, PageRenderer)>,
     /// Extracted page text per document version (the working bytes it was taken from).
     texts: HashMap<DocId, TextCache>,
+    /// Explicit grants. [`Capability::JavaScriptRun`] is absent unless added.
+    caps: CapabilitySet,
+    audit: AuditLog,
+    security: printcraft_guard::Session,
+    gate: Gate,
 }
 
 impl Default for Automation {
@@ -95,7 +118,60 @@ impl Default for Automation {
 
 impl Automation {
     pub fn new() -> Self {
-        Self { session: Session::new(), root: None, renderers: HashMap::new(), texts: HashMap::new() }
+        let mut session = Session::new();
+        // The desktop app leaves Acrobat JavaScript on. Automation does not, until
+        // [`Capability::JavaScriptRun`] is granted.
+        session.set_javascript(false);
+        Self {
+            session,
+            root: None,
+            renderers: HashMap::new(),
+            texts: HashMap::new(),
+            caps: CapabilitySet::operator_default(),
+            audit: AuditLog::default(),
+            security: printcraft_guard::Session::new(),
+            gate: Gate::Skip,
+        }
+    }
+
+    /// Replace the capability set. [`Capability::JavaScriptRun`] turns the engine's
+    /// JavaScript preference on; without it, field scripts do not run.
+    pub fn with_capabilities(mut self, caps: CapabilitySet) -> Self {
+        self.caps = caps;
+        self.sync_js();
+        self
+    }
+
+    /// Add one capability to the set this session already holds.
+    pub fn grant(mut self, cap: Capability) -> Self {
+        self.caps.insert(cap);
+        self.sync_js();
+        self
+    }
+
+    pub fn capabilities(&self) -> &CapabilitySet {
+        &self.caps
+    }
+
+    /// Security decisions for this session, oldest first. Events do not contain tokens or path text.
+    pub fn audit_events(&self) -> Vec<AuditEvent> {
+        self.audit.to_vec()
+    }
+
+    /// The session deadline used by [`Automation::call`]. Tests use it to expire a session
+    /// without waiting out the hour-long lifetime.
+    pub fn security_session_for_test(&self) -> &printcraft_guard::Session {
+        &self.security
+    }
+
+    fn sync_js(&mut self) {
+        // Changing the set resets the engine preference to match the capability.
+        // `js_enabled: false` can turn it off afterwards without removing the capability.
+        self.session.set_javascript(self.caps.contains(Capability::JavaScriptRun));
+    }
+
+    fn ensure(&self, cap: Capability) -> Result<()> {
+        if self.caps.contains(cap) { Ok(()) } else { Err(denied(cap)) }
     }
 
     /// Confine every path the tools read or write to `root` (relative paths resolve inside it).
@@ -116,6 +192,57 @@ impl Automation {
 
     /// Run the tool `name` with JSON `args` (an object; `null` means no arguments).
     pub fn call(&mut self, name: &str, args: &Value) -> Result<Vec<Content>> {
+        let started = Instant::now();
+        self.gate = Gate::Skip;
+        let result = self.call_inner(name, args);
+        self.record_call(name, args, &result, started);
+        result
+    }
+
+    fn record_call(&mut self, name: &str, args: &Value, result: &Result<Vec<Content>>, started: Instant) {
+        let denied_cap = match result {
+            Err(ToolError::Failed(message)) if message.starts_with("capability denied:") => {
+                Some(message.trim_start_matches("capability denied:").trim().to_string())
+            }
+            _ => None,
+        };
+        let expired = matches!(result, Err(ToolError::Failed(message)) if message == "session expired");
+        let budget = matches!(result, Err(ToolError::Failed(message)) if message.starts_with("too many in-flight"));
+        if self.gate == Gate::Skip && denied_cap.is_none() && !expired && !budget {
+            return;
+        }
+        let (decision, outcome, capability) = if expired {
+            ("deny", "expired", None)
+        } else if budget {
+            ("deny", "budget", None)
+        } else if let Some(cap) = denied_cap {
+            ("deny", "denied", Some(cap))
+        } else if result.is_ok() {
+            ("allow", "ok", None)
+        } else {
+            ("allow", "error", None)
+        };
+        let event = AuditEvent::new(self.security.id(), name, capability, decision, outcome, started.elapsed(), policy::path_handle(args));
+        printcraft_guard::emit_audit(&event);
+        self.audit.record(event);
+    }
+
+    fn call_inner(&mut self, name: &str, args: &Value) -> Result<Vec<Content>> {
+        if self.security.expired() {
+            self.gate = Gate::Denied;
+            return Err(ToolError::Failed("session expired".into()));
+        }
+        let _in_flight = match self.security.try_begin() {
+            Ok(permit) => permit,
+            Err(printcraft_guard::GuardError::Expired) => {
+                self.gate = Gate::Denied;
+                return Err(ToolError::Failed("session expired".into()));
+            }
+            Err(e) => {
+                self.gate = Gate::Denied;
+                return Err(ToolError::Failed(e.to_string()));
+            }
+        };
         let empty = json!({});
         let args = if args.is_null() { &empty } else { args };
         if !args.is_object() {
@@ -123,6 +250,15 @@ impl Automation {
         }
         let def = tools::find(name).ok_or_else(|| ToolError::UnknownTool(name.into()))?;
         tools::check_args(def, args)?;
+        if let Some(cap) = policy::missing(&self.caps, name, args, def.read_only) {
+            self.gate = Gate::Denied;
+            return Err(denied(cap));
+        }
+        self.gate = Gate::Allowed;
+        if self.security.touch().is_err() {
+            self.gate = Gate::Denied;
+            return Err(ToolError::Failed("session expired".into()));
+        }
         let a = Args(args);
         let out = match name {
             "doc_open" => self.doc_open(&a)?,
@@ -1318,6 +1454,12 @@ impl Automation {
     /// Resolve a user-supplied path, enforcing the root (if any). `for_write` allows a file that
     /// does not exist yet (its nearest existing ancestor must be inside the root).
     fn resolve(&self, path: &str, for_write: bool) -> Result<PathBuf> {
+        self.ensure(if for_write { Capability::FilesystemWrite } else { Capability::FilesystemRead })?;
+        if self.root.is_some() {
+            printcraft_guard::check_rooted_path(path).map_err(failed)?;
+        } else {
+            printcraft_guard::check_ambient_path(path).map_err(failed)?;
+        }
         let p = Path::new(path);
         let joined = match &self.root {
             Some(root) if p.is_relative() => root.join(p),

@@ -17,6 +17,7 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 
 use crate::{Automation, Content, ToolError};
+use printcraft_guard::{LineRead, MAX_REQUEST_BYTES, check_json_depth, fit_reply_string, read_bounded_line};
 
 /// Protocol revisions we speak, newest first.
 pub const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
@@ -44,28 +45,44 @@ impl McpServer {
         &self.automation
     }
 
-    /// Serve until `input` reaches end of file.
-    pub fn serve(&mut self, input: impl BufRead, mut output: impl Write) -> std::io::Result<()> {
-        for line in input.lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Some(reply) = self.handle_line(&line) {
-                writeln!(output, "{reply}")?;
-                output.flush()?;
+    /// Serve until `input` reaches end of file. Request lines are capped at 1 MiB and replies at 8 MiB.
+    pub fn serve(&mut self, mut input: impl BufRead, mut output: impl Write) -> std::io::Result<()> {
+        let mut line = String::new();
+        loop {
+            match read_bounded_line(&mut input, &mut line)? {
+                LineRead::Eof => return Ok(()),
+                LineRead::TooLong => {
+                    let reply = error(Value::Null, INVALID_REQUEST, &format!("request exceeds {MAX_REQUEST_BYTES} bytes"));
+                    writeln!(output, "{reply}")?;
+                    output.flush()?;
+                    return Ok(());
+                }
+                LineRead::Line => {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    if let Some(reply) = self.handle_line(line.trim_end_matches(['\r', '\n'])) {
+                        writeln!(output, "{reply}")?;
+                        output.flush()?;
+                    }
+                }
             }
         }
-        Ok(())
     }
 
     /// Handle one JSON-RPC message; returns the serialized reply, if one is due.
     pub fn handle_line(&mut self, line: &str) -> Option<String> {
+        if line.len() > MAX_REQUEST_BYTES {
+            return Some(error(Value::Null, INVALID_REQUEST, &format!("request exceeds {MAX_REQUEST_BYTES} bytes")).to_string());
+        }
         let reply = match serde_json::from_str::<Value>(line) {
-            Ok(msg) => self.handle(&msg),
+            Ok(msg) => match check_json_depth(&msg) {
+                Ok(()) => self.handle(&msg),
+                Err(e) => Some(error(msg.get("id").cloned().unwrap_or(Value::Null), INVALID_REQUEST, &e.to_string())),
+            },
             Err(e) => Some(error(Value::Null, PARSE_ERROR, &format!("parse error: {e}"))),
         };
-        reply.map(|r| r.to_string())
+        reply.map(|r| fit_reply_string(&r))
     }
 
     /// Handle one parsed message. Notifications (no `id`) get no reply.

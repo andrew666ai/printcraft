@@ -23,7 +23,8 @@ mcp::McpServer::new(a).serve(stdin, stdout)?             // newline-delimited JS
 - Unknown arguments are rejected, so typos fail loudly.
 - Tools that change a document return its summary (`doc`, `pages`, `dirty`, `undo`, `redo`, …).
 - `doc_close` refuses to drop unsaved changes unless `discard_changes: true`. `doc_save` writes atomically, incrementally in place, and in full for a new path.
-- With a root set, every read and write path must resolve inside it (symlinks and `..` included).
+- With a root set, every read and write path must be relative and resolve inside it (symlinks and `..` included). Device names, alternate separators, and control characters are rejected before the filesystem is touched.
+- Capabilities gate every tool. `JavaScriptRun` is absent unless granted, and the engine's JavaScript preference starts off. See the repository `SECURITY.md`.
 
 ## MCP server
 

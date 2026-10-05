@@ -11,9 +11,9 @@
 //! printcraft-cli split   <in.pdf> (--every N | --before 3,7) [--out-dir DIR]
 //! printcraft-cli check  <files or dirs…> [--timeout 20] [--dpi 36] [--json out.json]
 //! printcraft-cli tools                                       automation tools and their JSON Schemas
-//! printcraft-cli run    <tool> [key=value …] [--root DIR] [--out image.png]
+//! printcraft-cli run    <tool> [key=value …] [--root DIR] [--capabilities LIST] [--out image.png]
 //! printcraft-cli run    --script steps.json [--root DIR]      [{"tool": "doc_open", "args": {…}}, …]
-//! printcraft-cli mcp    [--root DIR]                          MCP server on stdin/stdout (opt-in)
+//! printcraft-cli mcp    [--root DIR] [--capabilities LIST]    MCP server on stdin/stdout (opt-in)
 //! printcraft-cli ui     --control FILE <method> [key=value …] [--out shot.png]
 //!                                                            drive a running app started with --control FILE
 //! ```
@@ -89,7 +89,8 @@ fn positional(args: &[String]) -> Vec<&str> {
             continue;
         }
         if a.starts_with("--") {
-            skip = true;
+            // `--untrusted` is a switch. Every other flag consumes the following argument.
+            skip = a != "--untrusted";
             continue;
         }
         out.push(a.as_str());
@@ -397,10 +398,29 @@ fn run_child(exe: &Path, file: &Path, dpi: &str, timeout: Duration) -> serde_jso
 // ---- automation --------------------------------------------------------------------------------
 
 fn automation(args: &[String]) -> Result<printcraft_automation::Automation, String> {
-    let a = printcraft_automation::Automation::new();
+    let caps = session_capabilities(args)?;
+    let a = printcraft_automation::Automation::new().with_capabilities(caps);
     match flag(args, "--root") {
         Some(root) => a.with_root(root).map_err(|e| format!("--root {root}: {e}")),
         None => Ok(a),
+    }
+}
+
+/// Operator sessions start with every capability except `JavaScriptRun`.
+/// `--capabilities` replaces that set. `--untrusted` (or `PRINTCRAFT_UNTRUSTED=1`) keeps
+/// `DocumentRead` and `UiInspect`.
+fn session_capabilities(args: &[String]) -> Result<printcraft_automation::guard::CapabilitySet, String> {
+    let untrusted = args.iter().any(|a| a == "--untrusted") || std::env::var("PRINTCRAFT_UNTRUSTED").ok().as_deref() == Some("1");
+    let listed = flag(args, "--capabilities").map(str::to_string).or_else(|| std::env::var("PRINTCRAFT_CAPABILITIES").ok());
+    if untrusted && listed.is_some() {
+        return Err("use either --untrusted or --capabilities, not both".into());
+    }
+    if untrusted {
+        return Ok(printcraft_automation::guard::CapabilitySet::narrow());
+    }
+    match listed.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(list) => printcraft_automation::guard::CapabilitySet::parse_list(list).map_err(|e| e.to_string()),
+        None => Ok(printcraft_automation::guard::CapabilitySet::operator_default()),
     }
 }
 
@@ -414,6 +434,21 @@ fn tools() -> Result<(), String> {
 }
 
 /// Print a tool's result: JSON as JSON; images go to `--out` (or are summarised).
+/// JSON retained for the batch reply budget. Image bytes are not kept when `--out` will store them;
+/// the summary is what the batch holds onto.
+fn batch_summary(content: &[printcraft_automation::Content]) -> serde_json::Value {
+    let parts: Vec<serde_json::Value> = content
+        .iter()
+        .map(|c| match c {
+            printcraft_automation::Content::Json(v) => v.clone(),
+            printcraft_automation::Content::Png { width, height, data } => {
+                serde_json::json!({ "image": "png", "width": width, "height": height, "bytes": data.len() })
+            }
+        })
+        .collect();
+    serde_json::json!(parts)
+}
+
 fn print_output(content: Vec<printcraft_automation::Content>, out: Option<&str>) -> Result<(), String> {
     for c in content {
         match c {
@@ -437,10 +472,17 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut auto = automation(args)?;
     if let Some(script) = flag(args, "--script") {
         let text = std::fs::read_to_string(script).map_err(|e| format!("{script}: {e}"))?;
+        if text.len() > printcraft_automation::guard::MAX_REQUEST_BYTES {
+            return Err(format!("{script}: script exceeds {} bytes", printcraft_automation::guard::MAX_REQUEST_BYTES));
+        }
         let steps: Vec<serde_json::Value> = serde_json::from_str(&text).map_err(|e| format!("{script}: {e}"))?;
+        printcraft_automation::guard::check_batch_len(steps.len()).map_err(|e| e.to_string())?;
+        let mut budget = printcraft_automation::guard::BatchReplyBudget::default();
         for (i, step) in steps.iter().enumerate() {
             let tool = step["tool"].as_str().ok_or(format!("step {}: missing \"tool\"", i + 1))?;
             let content = auto.call(tool, &step["args"]).map_err(|e| format!("step {} ({tool}): {e}", i + 1))?;
+            let summary = batch_summary(&content);
+            budget.charge(&summary).map_err(|e| format!("step {} ({tool}): {e}", i + 1))?;
             print_output(content, step["out"].as_str())?;
         }
         return Ok(());
@@ -495,7 +537,16 @@ fn ui(args: &[String]) -> Result<(), String> {
             None => Ok(reply["result"].clone()),
         }
     };
-    rpc(1, "auth", serde_json::json!({ "token": token }))?;
+    let wanted = ui_capabilities(&method, &params);
+    let auth = rpc(1, "auth", serde_json::json!({ "token": token, "capabilities": wanted }))?;
+    let granted = auth["capabilities"].as_array().cloned().unwrap_or_default();
+    for cap in &wanted {
+        if !granted.iter().any(|g| g.as_str() == Some(cap)) {
+            return Err(format!(
+                "the control session does not grant {cap}. Start the app with --control-capabilities including it. JavaScriptRun is off unless it is named"
+            ));
+        }
+    }
     let mut result = rpc(2, &method, serde_json::Value::Object(params))?;
     if let (Some(out), Some(data)) = (flag(args, "--out"), result.get("png_base64").and_then(|d| d.as_str())) {
         use base64::Engine as _;
@@ -505,4 +556,29 @@ fn ui(args: &[String]) -> Result<(), String> {
     }
     println!("{}", serde_json::to_string_pretty(&result).unwrap_or_default());
     Ok(())
+}
+
+/// Capabilities the official UI client asks for. A raw client that omits this list only receives
+/// `DocumentRead` and `UiInspect`. `JavaScriptRun` is requested only for the JavaScript console.
+fn ui_capabilities(method: &str, params: &serde_json::Map<String, serde_json::Value>) -> Vec<&'static str> {
+    let value = params.get("value").and_then(|v| v.as_str()).unwrap_or("");
+    let key = params.get("key").and_then(|v| v.as_str()).unwrap_or("");
+    let id = params.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    match method {
+        "ui.state" | "ui.inspect" | "ui.commands" | "ui.screenshot" => vec!["DocumentRead", "UiInspect"],
+        "ui.open" => vec!["DocumentRead", "FilesystemRead"],
+        "ui.click" | "ui.drag" | "ui.type" | "ui.key" => vec!["UiControl"],
+        "ui.set" if key == "dialog" && matches!(value, "js-console" | "document-js") => vec!["UiControl", "JavaScriptRun"],
+        "ui.set" if key == "theme" || (key == "dialog" && value == "preferences") => vec!["PreferencesWrite"],
+        "ui.command" if id == "tools.js_console" || id.starts_with("js.") || id.contains("javascript") => {
+            vec!["UiControl", "JavaScriptRun"]
+        }
+        "ui.command" if id == "app.preferences" => vec!["UiControl", "PreferencesWrite"],
+        "ui.command" if id.starts_with("help.") => vec!["ApplicationControl"],
+        "ui.command" if id == "file.open" => vec!["UiControl", "FilesystemRead", "DocumentRead"],
+        "ui.command" | "ui.set" => {
+            vec!["UiControl", "DocumentRead", "DocumentWrite", "PreferencesWrite", "ApplicationControl", "FilesystemRead"]
+        }
+        _ => vec!["DocumentRead", "UiInspect", "UiControl"],
+    }
 }

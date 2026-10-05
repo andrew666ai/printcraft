@@ -616,59 +616,89 @@ pub struct Endpoint {
     pub token: String,
 }
 
-/// Listen on `127.0.0.1` (random port) and forward authenticated requests to `client`.
-///
-/// Protocol: newline-delimited JSON-RPC 2.0. The first request on a connection must be
-/// `{"method": "auth", "params": {"token": …}}`; anything else closes the connection.
+/// Listener policy. The token is 256 bits. `allowlist` is the most any client may be granted;
+/// [`Capability::JavaScriptRun`] is absent unless the operator names it.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct ControlConfig {
+    pub token: String,
+    pub allowlist: printcraft_guard::CapabilitySet,
+    pub absolute_ttl: std::time::Duration,
+    pub idle_ttl: std::time::Duration,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl ControlConfig {
+    /// Build a config from explicit arguments, then `PRINTCRAFT_CONTROL_*` environment variables.
+    pub fn resolve(token: Option<String>, token_file: Option<&std::path::Path>, capabilities: Option<&str>, untrusted: bool) -> Result<Self, String> {
+        if untrusted && capabilities.is_some() {
+            return Err("use either --control-untrusted or --control-capabilities, not both".into());
+        }
+        let file = token_file.map(std::path::Path::to_path_buf);
+        let (supplied, file) = printcraft_guard::control_token_inputs(token, file);
+        let token = printcraft_guard::server_token(supplied.as_deref(), file.as_deref()).map_err(|e| e.to_string())?;
+        let from_env = std::env::var("PRINTCRAFT_CONTROL_CAPABILITIES").ok();
+        let listed = capabilities.map(str::to_string).or(from_env);
+        let env_untrusted = std::env::var("PRINTCRAFT_CONTROL_UNTRUSTED").ok().as_deref() == Some("1");
+        let allowlist = if untrusted || (env_untrusted && capabilities.is_none()) {
+            printcraft_guard::CapabilitySet::narrow()
+        } else if let Some(list) = listed.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            printcraft_guard::CapabilitySet::parse_list(list).map_err(|e| e.to_string())?
+        } else {
+            printcraft_guard::CapabilitySet::operator_default()
+        };
+        Ok(Self { token, allowlist, absolute_ttl: printcraft_guard::SESSION_TTL, idle_ttl: printcraft_guard::SESSION_TTL })
+    }
+}
+
+/// Listen on `127.0.0.1` (random port) with a fresh token and the operator allowlist
+/// (everything except [`printcraft_guard::Capability::JavaScriptRun`]).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn serve(client: ControlClient) -> std::io::Result<Endpoint> {
-    use std::io::{BufRead, BufReader, Write};
+    let token = printcraft_guard::generate_token().map_err(|e| std::io::Error::other(e.to_string()))?;
+    serve_with(
+        client,
+        ControlConfig {
+            token,
+            allowlist: printcraft_guard::CapabilitySet::operator_default(),
+            absolute_ttl: printcraft_guard::SESSION_TTL,
+            idle_ttl: printcraft_guard::SESSION_TTL,
+        },
+    )
+}
+
+/// Listen on `127.0.0.1` and forward requests that pass authentication and the capability gate.
+///
+/// Protocol: newline-delimited JSON-RPC 2.0. The first request on a connection must be
+/// `auth` with the bearer token. No other method is dispatched before that. A client that
+/// omits `capabilities` receives only `DocumentRead` and `UiInspect`.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn serve_with(client: ControlClient, config: ControlConfig) -> std::io::Result<Endpoint> {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
-    let port = listener.local_addr()?.port();
-    let token = random_token()?;
-    let expected = token.clone();
+    let local = listener.local_addr()?;
+    if !printcraft_guard::is_loopback(local.ip()) {
+        return Err(std::io::Error::other("control channel refused a non-loopback bind"));
+    }
+    let port = local.port();
+    let token = config.token.clone();
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let limiter = printcraft_guard::ConnectionLimiter::new(printcraft_guard::MAX_CONNECTIONS);
     std::thread::Builder::new().name("printcraft-control".into()).spawn(move || {
         for stream in listener.incoming().flatten() {
+            let Some(permit) = limiter.try_acquire() else {
+                let _ = reject_connection(&stream, &rpc_error(Value::Null, -32005, "too many connections"));
+                continue;
+            };
             let client = client.clone();
-            let expected = expected.clone();
+            let expected = config.token.clone();
+            let allowlist = config.allowlist.clone();
+            let in_flight = Arc::clone(&in_flight);
+            let absolute = config.absolute_ttl;
+            let idle = config.idle_ttl;
             let _ = std::thread::Builder::new().name("printcraft-control-conn".into()).spawn(move || {
-                let Ok(read) = stream.try_clone() else { return };
-                let mut write = stream;
-                let mut authed = false;
-                for line in BufReader::new(read).lines() {
-                    let Ok(line) = line else { break };
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    let (reply, close) = match serde_json::from_str::<Value>(&line) {
-                        Err(e) => (rpc_error(Value::Null, -32700, &format!("parse error: {e}")), false),
-                        Ok(msg) => {
-                            let id = msg.get("id").cloned().unwrap_or(Value::Null);
-                            let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
-                            let params = msg.get("params").cloned().unwrap_or(Value::Null);
-                            if !authed {
-                                let ok =
-                                    method == "auth" && params.get("token").and_then(Value::as_str).is_some_and(|t| constant_time_eq(t, &expected));
-                                authed = ok;
-                                if ok {
-                                    (json!({ "jsonrpc": "2.0", "id": id, "result": { "ok": true } }), false)
-                                } else {
-                                    (rpc_error(id, -32001, "authenticate first: auth {token}"), true)
-                                }
-                            } else {
-                                let rx = client.send(method, params);
-                                match rx.recv_timeout(std::time::Duration::from_secs(30)) {
-                                    Ok(Ok(v)) => (json!({ "jsonrpc": "2.0", "id": id, "result": v }), false),
-                                    Ok(Err(e)) => (rpc_error(id, -32000, &e), false),
-                                    Err(_) => (rpc_error(id, -32002, "the app did not answer within 30 s"), false),
-                                }
-                            }
-                        }
-                    };
-                    if writeln!(write, "{reply}").and_then(|_| write.flush()).is_err() || close {
-                        break;
-                    }
-                }
+                let _permit = permit;
+                serve_connection(stream, client, expected, allowlist, absolute, idle, in_flight.as_ref());
             });
         }
     })?;
@@ -676,19 +706,203 @@ pub fn serve(client: ControlClient) -> std::io::Result<Endpoint> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn reject_connection(stream: &std::net::TcpStream, reply: &Value) -> std::io::Result<()> {
+    let mut stream = stream.try_clone()?;
+    let _ = printcraft_guard::configure_stream(&stream);
+    write_reply(&mut stream, reply)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn serve_connection(
+    stream: std::net::TcpStream,
+    client: ControlClient,
+    expected: String,
+    allowlist: printcraft_guard::CapabilitySet,
+    absolute: std::time::Duration,
+    idle: std::time::Duration,
+    in_flight: &std::sync::atomic::AtomicUsize,
+) {
+    use std::io::BufReader;
+    if printcraft_guard::configure_stream(&stream).is_err() {
+        return;
+    }
+    match stream.peer_addr() {
+        Ok(addr) if printcraft_guard::is_loopback(addr.ip()) => {}
+        _ => return,
+    }
+    let Ok(read) = stream.try_clone() else { return };
+    let mut write = stream;
+    let mut reader = BufReader::new(read);
+    let mut line = String::new();
+    let mut session: Option<(printcraft_guard::Session, printcraft_guard::CapabilitySet)> = None;
+    let gate = ControlGate { client: &client, expected: &expected, allowlist: &allowlist, absolute, idle, in_flight };
+    while let Ok(frame) = printcraft_guard::read_bounded_line(&mut reader, &mut line) {
+        let (reply, close) = match frame {
+            printcraft_guard::LineRead::Eof => break,
+            printcraft_guard::LineRead::TooLong => {
+                (rpc_error(Value::Null, -32005, &format!("request exceeds {} bytes", printcraft_guard::MAX_REQUEST_BYTES)), true)
+            }
+            printcraft_guard::LineRead::Line if line.trim().is_empty() => continue,
+            printcraft_guard::LineRead::Line => {
+                let text = line.trim_end_matches(['\r', '\n']);
+                dispatch_line(text, &gate, &mut session)
+            }
+        };
+        if write_reply(&mut write, &reply).is_err() || close {
+            break;
+        }
+    }
+}
+
+/// Shared inputs for one control connection. Grouped so dispatch stays under Clippy's argument cap.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy)]
+struct ControlGate<'a> {
+    client: &'a ControlClient,
+    expected: &'a str,
+    allowlist: &'a printcraft_guard::CapabilitySet,
+    absolute: std::time::Duration,
+    idle: std::time::Duration,
+    in_flight: &'a std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn dispatch_line(
+    line: &str,
+    gate: &ControlGate<'_>,
+    session: &mut Option<(printcraft_guard::Session, printcraft_guard::CapabilitySet)>,
+) -> (Value, bool) {
+    use printcraft_guard::{AuditEvent, CapabilitySet, authenticate, check_json_depth, emit_audit, try_acquire_global};
+    let ControlGate { client, expected, allowlist, absolute, idle, in_flight } = *gate;
+    let msg: Value = match serde_json::from_str(line) {
+        Ok(msg) => msg,
+        Err(e) => return (rpc_error(Value::Null, -32700, &format!("parse error: {e}")), false),
+    };
+    let id = msg.get("id").cloned().unwrap_or(Value::Null);
+    if let Err(e) = check_json_depth(&msg) {
+        return (rpc_error(id, -32005, &e.to_string()), false);
+    }
+    if session.is_none() {
+        let decision = authenticate(line, expected, allowlist, &CapabilitySet::narrow());
+        if !decision.ok {
+            let event = AuditEvent::new("unauthenticated", "auth", None, "deny", "unauthenticated", std::time::Duration::ZERO, None);
+            emit_audit(&event);
+            return (rpc_error(decision.id, -32001, "authentication required"), true);
+        }
+        let mut security = printcraft_guard::Session::with_limits(absolute, idle, 1);
+        let _ = security.touch();
+        let names = decision.granted.names();
+        let event = AuditEvent::new(security.id(), "auth", Some(names.join(",")), "allow", "ok", std::time::Duration::ZERO, None);
+        emit_audit(&event);
+        let reply = json!({
+            "jsonrpc": "2.0",
+            "id": decision.id,
+            "result": { "ok": true, "session": security.id(), "capabilities": names, "expires_in_secs": security.expires_in_secs() },
+        });
+        *session = Some((security, decision.granted));
+        return (reply, false);
+    }
+    let Some((security, caps)) = session.as_mut() else {
+        return (rpc_error(id, -32001, "authentication required"), true);
+    };
+    if security.touch().is_err() {
+        let event = AuditEvent::new(security.id(), "auth", None, "deny", "expired", std::time::Duration::ZERO, None);
+        emit_audit(&event);
+        return (rpc_error(id, -32004, "session expired"), true);
+    }
+    let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+    let params = msg.get("params").cloned().unwrap_or(Value::Null);
+    if let Some(missing) = missing_capability(method, &params, caps) {
+        let event = AuditEvent::new(security.id(), method, Some(missing.name().into()), "deny", "denied", std::time::Duration::ZERO, None);
+        emit_audit(&event);
+        return (rpc_error(id, -32003, &format!("capability denied: {}", missing.name())), false);
+    }
+    let Some(_global) = try_acquire_global(in_flight, printcraft_guard::MAX_IN_FLIGHT) else {
+        let event = AuditEvent::new(security.id(), method, None, "deny", "budget", std::time::Duration::ZERO, None);
+        emit_audit(&event);
+        return (rpc_error(id, -32005, "too many in-flight requests"), false);
+    };
+    let _slot = match security.try_begin() {
+        Ok(slot) => slot,
+        Err(_) => {
+            let event = AuditEvent::new(security.id(), method, None, "deny", "budget", std::time::Duration::ZERO, None);
+            emit_audit(&event);
+            return (rpc_error(id, -32005, "too many in-flight requests"), false);
+        }
+    };
+    let started = std::time::Instant::now();
+    let session_id = security.id().to_string();
+    let rx = client.send(method, params.clone());
+    let (reply, outcome) = match rx.recv_timeout(printcraft_guard::IO_TIMEOUT) {
+        Ok(Ok(v)) => (json!({ "jsonrpc": "2.0", "id": id, "result": v }), "ok"),
+        Ok(Err(e)) => (rpc_error(id, -32000, &e), "error"),
+        Err(_) => (rpc_error(id, -32002, "the app did not answer within 30 s"), "error"),
+    };
+    let path = params.get("path").and_then(Value::as_str).map(printcraft_guard::redact_path);
+    let event = AuditEvent::new(&session_id, method, None, "allow", outcome, started.elapsed(), path);
+    emit_audit(&event);
+    (reply, false)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn missing_capability(method: &str, params: &Value, caps: &printcraft_guard::CapabilitySet) -> Option<printcraft_guard::Capability> {
+    use printcraft_guard::Capability;
+    let needed = match method {
+        "ui.state" | "ui.inspect" | "ui.commands" | "ui.screenshot" => vec![Capability::DocumentRead, Capability::UiInspect],
+        "ui.click" | "ui.drag" | "ui.type" | "ui.key" => vec![Capability::UiControl],
+        "ui.open" => vec![Capability::FilesystemRead, Capability::DocumentRead],
+        "ui.set" => ui_set_capabilities(params),
+        "ui.command" => ui_command_capabilities(params),
+        _ => return None,
+    };
+    needed.into_iter().find(|cap| !caps.contains(*cap))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn param_str<'a>(params: &'a Value, key: &str) -> &'a str {
+    params.get(key).and_then(Value::as_str).unwrap_or("")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn ui_set_capabilities(params: &Value) -> Vec<printcraft_guard::Capability> {
+    use printcraft_guard::Capability;
+    let key = param_str(params, "key");
+    let value = param_str(params, "value");
+    if key == "theme" || (key == "dialog" && value == "preferences") {
+        vec![Capability::PreferencesWrite]
+    } else if key == "dialog" && matches!(value, "js-console" | "document-js") {
+        vec![Capability::JavaScriptRun, Capability::UiControl]
+    } else {
+        vec![Capability::UiControl]
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn ui_command_capabilities(params: &Value) -> Vec<printcraft_guard::Capability> {
+    use printcraft_guard::Capability;
+    let id = param_str(params, "id");
+    if id == "tools.js_console" || id.starts_with("js.") || id.contains("javascript") {
+        vec![Capability::JavaScriptRun, Capability::UiControl]
+    } else if id == "app.preferences" {
+        vec![Capability::PreferencesWrite, Capability::UiControl]
+    } else if id.starts_with("help.") {
+        vec![Capability::ApplicationControl]
+    } else if id == "file.open" {
+        vec![Capability::FilesystemRead, Capability::DocumentRead, Capability::UiControl]
+    } else {
+        vec![Capability::UiControl]
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn write_reply(write: &mut impl std::io::Write, reply: &Value) -> std::io::Result<()> {
+    let bytes = printcraft_guard::fit_reply(reply);
+    write.write_all(&bytes)?;
+    write.write_all(b"\n")?;
+    write.flush()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn rpc_error(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn constant_time_eq(a: &str, b: &str) -> bool {
-    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
-
-/// 128 random bits from the OS, hex-encoded.
-#[cfg(not(target_arch = "wasm32"))]
-fn random_token() -> std::io::Result<String> {
-    let mut bytes = [0u8; 16];
-    getrandom::fill(&mut bytes).map_err(|e| std::io::Error::other(e.to_string()))?;
-    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
