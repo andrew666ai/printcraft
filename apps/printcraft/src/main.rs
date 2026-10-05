@@ -9,7 +9,10 @@
 //!
 //! `--control <file>` enables the UI control channel (off by default): the app listens on a random
 //! loopback port and writes `{"port", "token", "pid"}` to `<file>` (owner-only permissions).
-//! Agents then drive it with `printcraft-cli ui --control <file> <method> …`.
+//! The token is 256 bits. Supply it with `--control-token-file` / `PRINTCRAFT_CONTROL_TOKEN_FILE`
+//! or `--control-token` / `PRINTCRAFT_CONTROL_TOKEN`; otherwise one is generated and stored only
+//! in `<file>`. Agents then drive it with `printcraft-cli ui --control <file> <method> …`.
+//! See `SECURITY.md`. Stdio MCP (`printcraft-cli mcp`) does not use this token.
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
@@ -40,6 +43,9 @@ fn main() -> eframe::Result {
     let mut files = Vec::new();
     let mut options: Vec<(String, String)> = Vec::new();
     let mut control_file: Option<String> = None;
+    let mut control_token: Option<String> = None;
+    let mut control_token_file: Option<String> = None;
+    let mut control_usage_error: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -47,7 +53,18 @@ fn main() -> eframe::Result {
                 println!("printcraft {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
             }
-            "--control" => control_file = args.next(),
+            "--control" => match args.next() {
+                Some(path) => control_file = Some(path),
+                None => control_usage_error = Some("--control needs a file path".into()),
+            },
+            "--control-token" => match args.next() {
+                Some(token) => control_token = Some(token),
+                None => control_usage_error = Some("--control-token needs 64 hexadecimal characters".into()),
+            },
+            "--control-token-file" => match args.next() {
+                Some(path) => control_token_file = Some(path),
+                None => control_usage_error = Some("--control-token-file needs a path".into()),
+            },
             flag if flag.starts_with("--") => {
                 let value = args.next().unwrap_or_default();
                 options.push((flag.trim_start_matches("--").to_string(), value));
@@ -86,12 +103,16 @@ fn main() -> eframe::Result {
             app.integrated_titlebar = integrated;
             app.update_source = Some(std::sync::Arc::new(updates::latest_release));
             app.keychain_ids = cfg!(target_os = "macos");
-            if let Some(file) = &control_file {
+            if let Some(msg) = &control_usage_error {
+                eprintln!("printcraft: {msg}");
+            } else if let Some(file) = &control_file {
                 let client = app.attach_control(&cc.egui_ctx);
-                match printcraft_ui_egui::control::serve(client).and_then(|ep| write_control_file(file, ep.port, &ep.token).map(|()| ep.port)) {
+                match control_endpoint(file, control_token.as_deref(), control_token_file.as_deref(), client) {
                     Ok(port) => eprintln!("printcraft: UI control channel on 127.0.0.1:{port} (connection details in {file})"),
                     Err(e) => eprintln!("printcraft: --control {file}: {e}"),
                 }
+            } else if control_token.is_some() || control_token_file.is_some() {
+                eprintln!("printcraft: control token options apply only with --control FILE");
             }
             // Autosave unsaved changes; offer to recover documents a crashed session left behind.
             if let Some(dir) = printcraft_ui_egui::RecoveryStore::default_dir() {
@@ -108,6 +129,29 @@ fn main() -> eframe::Result {
             Ok(Box::new(app))
         }),
     )
+}
+
+/// Token from the flag, then the environment. Flags win. Neither means "generate".
+fn control_token_sources(flag_token: Option<&str>, flag_file: Option<&str>) -> (Option<String>, Option<String>) {
+    let token = flag_token.map(str::to_string).or_else(|| std::env::var("PRINTCRAFT_CONTROL_TOKEN").ok().filter(|s| !s.trim().is_empty()));
+    let file = flag_file.map(str::to_string).or_else(|| std::env::var("PRINTCRAFT_CONTROL_TOKEN_FILE").ok().filter(|s| !s.trim().is_empty()));
+    (token, file)
+}
+
+/// Bind loopback control and write `{port, token, pid}` to `file` (mode 0600). The token is not
+/// printed. A generated token lives only in that file, or also in `--control-token-file` when
+/// that path did not exist yet.
+fn control_endpoint(
+    file: &str,
+    flag_token: Option<&str>,
+    flag_file: Option<&str>,
+    client: printcraft_ui_egui::control::ControlClient,
+) -> std::io::Result<u16> {
+    let (supplied, token_file) = control_token_sources(flag_token, flag_file);
+    let token = printcraft_ui_egui::control::resolve_server_token(supplied.as_deref(), token_file.as_deref().map(std::path::Path::new))?;
+    let ep = printcraft_ui_egui::control::serve_with_token(client, token)?;
+    write_control_file(file, ep.port, &ep.token)?;
+    Ok(ep.port)
 }
 
 /// Write the control endpoint so that only the current user can read the token.

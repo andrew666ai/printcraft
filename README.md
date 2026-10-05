@@ -296,7 +296,7 @@ Edits stay in memory, undoable, until `doc_save`. Saving to the same file append
 
 ### Driving the app itself
 
-Start the desktop app with `printcraft --control /tmp/pc.json` and an agent can see and operate the real interface: the widget tree with labels and positions (from the accessibility tree), clicks, typing, keys, commands, view options and screenshots. This is also off by default. It listens only on loopback, and every connection must present the random token written to that file, which only you can read.
+Start the desktop app with `printcraft --control /tmp/pc.json` and an agent can see and operate the real interface: the widget tree with labels and positions (from the accessibility tree), clicks, typing, keys, commands, view options and screenshots. This is also off by default. It listens only on loopback. The first line on each connection must present a 256-bit token, written into that file (only you can read it) or supplied with `--control-token-file`. See [SECURITY.md](SECURITY.md). `printcraft-cli mcp` stays on stdin/stdout and does not use the token.
 
 ```sh
 printcraft-cli ui --control /tmp/pc.json inspect query=rotate      # find widgets

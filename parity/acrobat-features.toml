@@ -9350,8 +9350,8 @@ milestone = "M3"
 status = "shipped"
 commands = []
 tools = []
-evidence = ["crates/ui-egui/tests/control.rs::inspect_and_click_by_label_and_id", "crates/ui-egui/tests/control.rs::commands_keys_and_typing", "crates/ui-egui/tests/control.rs::loopback_transport_requires_the_token"]
-notes = ""
+evidence = ["crates/ui-egui/tests/control.rs::inspect_and_click_by_label_and_id", "crates/ui-egui/tests/control.rs::commands_keys_and_typing", "crates/ui-egui/tests/control.rs::loopback_transport_requires_the_token", "crates/ui-egui/src/control.rs::unauthenticated_and_wrong_token_are_rejected"]
+notes = "Loopback only. A 256-bit bearer token is required before any method. Budgets: 16 connections, 1 MiB request lines, 8 MiB replies. Not a per-method role system."
 
 [[feature]]
 id = "misc.ui-screenshots"

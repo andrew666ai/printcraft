@@ -56,6 +56,23 @@ fn about_dialog_shows_the_brand_and_links() {
 }
 
 #[test]
+fn document_urls_only_open_http_and_https() {
+    let mut app = PrintCraftApp::new();
+    for blocked in ["javascript:alert(1)", "file:///etc/passwd", "data:text/html,hi", "http://", "https:example.com", "http://bad host"] {
+        app.open_url(blocked);
+        assert!(app.last_opened_url.is_none(), "{blocked}");
+        let toast = app.toast.clone().unwrap().0;
+        assert!(toast.contains("only http and https"), "{blocked}: {toast}");
+        assert!(!toast.contains("alert"), "{toast}");
+        app.toast = None;
+    }
+    app.open_url("  https://example.com/doc  ");
+    assert_eq!(app.last_opened_url.as_deref(), Some("https://example.com/doc"));
+    app.open_url("HTTP://example.com/a");
+    assert_eq!(app.last_opened_url.as_deref(), Some("HTTP://example.com/a"));
+}
+
+#[test]
 fn help_commands_open_each_link() {
     for l in links::LINKS {
         let mut h = harness(|_| {});

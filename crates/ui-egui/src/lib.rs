@@ -438,6 +438,30 @@ impl Default for PrintCraftApp {
     }
 }
 
+/// `http://` or `https://` with a host, and no spaces or control characters.
+fn is_http_url(url: &str) -> bool {
+    let url = url.trim();
+    if url.is_empty() || url.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return false;
+    }
+    let Some((scheme, rest)) = url.split_once(':') else { return false };
+    if !scheme.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return false;
+    }
+    let allowed = scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http");
+    allowed && rest.starts_with("//") && rest.len() > 2
+}
+
+/// Name the scheme without echoing the rest of an untrusted URI.
+fn refused_link_message(url: &str) -> String {
+    let scheme = url.trim().split([':', '/', '?', '#', ' ', '\n', '\r']).next().unwrap_or("");
+    if !scheme.is_empty() && scheme.len() <= 16 && scheme.bytes().all(|b| b.is_ascii_alphabetic()) {
+        format!("Refused to open a {scheme} link; only http and https links are opened")
+    } else {
+        "Refused to open this link; only http and https links are opened".to_string()
+    }
+}
+
 impl PrintCraftApp {
     pub fn new() -> Self {
         Self {
@@ -777,8 +801,16 @@ impl PrintCraftApp {
         client
     }
 
-    /// Open a web link in the system browser (a new tab on the web).
+    /// Open an http(s) link in the system browser (a new tab on the web).
+    ///
+    /// Document links, button actions and JavaScript `launchURL` all come through here.
+    /// Anything that is not `http` or `https` is refused: a PDF is untrusted input.
     pub fn open_url(&mut self, url: &str) {
+        let url = url.trim();
+        if !is_http_url(url) {
+            self.notify(refused_link_message(url));
+            return;
+        }
         if let Some(ctx) = &self.ctx {
             ctx.open_url(egui::OpenUrl::new_tab(url));
         }
