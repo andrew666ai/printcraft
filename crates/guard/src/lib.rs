@@ -739,7 +739,6 @@ pub fn redact_path(path: &str) -> String {
 /// Allows `http`, `https`, and `mailto` only. `javascript:`, `file:`, `data:`, and anything
 /// with userinfo, whitespace, or a missing host is rejected.
 pub fn external_url_allowed(url: &str) -> bool {
-    let url = url.trim();
     if url.is_empty() || url.len() > 2048 || url.chars().any(|c| c.is_control() || c.is_whitespace() || c == '\\') {
         return false;
     }
@@ -911,7 +910,7 @@ mod tests {
         assert!(token_matches(&a, &a.to_ascii_uppercase()));
         assert!(!token_matches(&a, &b));
         assert!(!token_matches(&a, "short"));
-        assert!(!token_matches(&a, &format!("{a}00")[..64]));
+        assert!(!token_matches(&a, &format!("{a}00")));
         let mut flipped = a.clone();
         let last = flipped.pop().unwrap();
         flipped.push(if last == 'a' { 'b' } else { 'a' });

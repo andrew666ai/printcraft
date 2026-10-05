@@ -205,13 +205,14 @@ fn errors_are_specific_and_safe() {
     ok(&mut a, "doc_close", json!({ "doc": doc, "discard_changes": true }));
     assert_eq!(ok(&mut a, "doc_list", json!({}))["documents"], json!([]));
 
-    // The root confines reads and writes.
+    // The root confines reads and writes. Absolute paths and `..` are refused before the file is opened.
     let outside = std::env::temp_dir().join("printcraft-automation-outside.pdf");
     std::fs::write(&outside, fixture(1)).unwrap();
-    assert!(matches!(err(&mut a, "doc_open", json!({ "path": outside.to_str().unwrap() })), ToolError::Failed(m) if m.contains("outside")));
-    assert!(
-        matches!(err(&mut a, "doc_open", json!({ "path": "../printcraft-automation-outside.pdf" })), ToolError::Failed(m) if m.contains("outside"))
-    );
+    assert!(matches!(err(&mut a, "doc_open", json!({ "path": outside.to_str().unwrap() })), ToolError::Failed(m) if m.contains("not allowed")));
+    assert!(matches!(
+        err(&mut a, "doc_open", json!({ "path": "../printcraft-automation-outside.pdf" })),
+        ToolError::Failed(m) if m.contains("not allowed")
+    ));
     let doc = ok(&mut a, "doc_open", json!({ "path": "a.pdf" }))["doc"].as_u64().unwrap();
     assert!(a.call("doc_save", &json!({ "doc": doc, "path": "new/../../escape.pdf" })).is_err());
     assert!(a.call("doc_save", &json!({ "doc": doc, "path": outside.to_str().unwrap() })).is_err());
